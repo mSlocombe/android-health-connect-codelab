@@ -33,6 +33,8 @@ import androidx.health.connect.client.records.TotalCaloriesBurnedRecord
 import androidx.health.connect.client.records.WeightRecord
 import androidx.health.connect.client.records.metadata.DataOrigin
 import androidx.health.connect.client.records.metadata.Metadata
+import androidx.health.connect.client.request.AggregateRequest
+import androidx.health.connect.client.request.ChangesTokenRequest
 import androidx.health.connect.client.request.ReadRecordsRequest
 import androidx.health.connect.client.time.TimeRangeFilter
 import androidx.health.connect.client.units.Energy
@@ -42,6 +44,7 @@ import androidx.work.WorkManager
 import com.example.healthconnect.codelab.workers.ReadStepWorker
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
+import java.io.IOException
 import java.time.Instant
 import java.time.ZonedDateTime
 import java.util.concurrent.TimeUnit
@@ -116,12 +119,13 @@ class HealthConnectManager(private val context: Context) {
         return response.records
     }
 
-    /**
-     * TODO: Returns the weekly average of [WeightRecord]s.
-     */
     suspend fun computeWeeklyAverage(start: Instant, end: Instant): Mass? {
-        // Toast.makeText(context, "TODO: get average weight", Toast.LENGTH_SHORT).show()
-        return null
+        val request = AggregateRequest(
+            metrics = setOf(WeightRecord.WEIGHT_AVG),
+            timeRangeFilter = TimeRangeFilter.between(start, end)
+        )
+        val response = healthConnectClient.aggregate(request)
+        return response[WeightRecord.WEIGHT_AVG]
     }
 
     /**
@@ -191,28 +195,66 @@ class HealthConnectManager(private val context: Context) {
         )
     }
 
-    /**
-     * TODO: Reads aggregated data and raw data for selected data types, for a given [ExerciseSessionRecord].
-     */
     suspend fun readAssociatedSessionData(
         uid: String,
     ): ExerciseSessionData {
-        TODO()
+        val exerciseSession = healthConnectClient.readRecord(ExerciseSessionRecord::class, uid)
+        // Use the start time and end time from the session, for reading raw and aggregate data.
+        val timeRangeFilter = TimeRangeFilter.between(
+            startTime = exerciseSession.record.startTime,
+            endTime = exerciseSession.record.endTime
+        )
+        val aggregateDataTypes = setOf(
+            ExerciseSessionRecord.EXERCISE_DURATION_TOTAL,
+            StepsRecord.COUNT_TOTAL,
+            TotalCaloriesBurnedRecord.ENERGY_TOTAL,
+            HeartRateRecord.BPM_AVG,
+            HeartRateRecord.BPM_MAX,
+            HeartRateRecord.BPM_MIN,
+        )
+        // Limit the data read to just the application that wrote the session. This may or may not
+        // be desirable depending on the use case: In some cases, it may be useful to combine with
+        // data written by other apps.
+        val dataOriginFilter = setOf(exerciseSession.record.metadata.dataOrigin)
+        val aggregateRequest = AggregateRequest(
+            metrics = aggregateDataTypes,
+            timeRangeFilter = timeRangeFilter,
+            dataOriginFilter = dataOriginFilter
+        )
+        val aggregateData = healthConnectClient.aggregate(aggregateRequest)
+        val heartRateData = readData<HeartRateRecord>(timeRangeFilter, dataOriginFilter)
+
+        return ExerciseSessionData(
+            uid = uid,
+            totalActiveTime = aggregateData[ExerciseSessionRecord.EXERCISE_DURATION_TOTAL],
+            totalSteps = aggregateData[StepsRecord.COUNT_TOTAL],
+            totalEnergyBurned = aggregateData[TotalCaloriesBurnedRecord.ENERGY_TOTAL],
+            minHeartRate = aggregateData[HeartRateRecord.BPM_MIN],
+            maxHeartRate = aggregateData[HeartRateRecord.BPM_MAX],
+            avgHeartRate = aggregateData[HeartRateRecord.BPM_AVG],
+            heartRateSeries = heartRateData,
+        )
     }
 
-    /**
-     * TODO: Obtains a changes token for the specified record types.
-     */
     suspend fun getChangesToken(): String {
-        Toast.makeText(context, "TODO: get changes token", Toast.LENGTH_SHORT).show()
-        return String()
+        return healthConnectClient.getChangesToken(
+            ChangesTokenRequest(
+                recordTypes = setOf(ExerciseSessionRecord::class, WeightRecord::class, StepsRecord::class),
+            )
+        )
     }
 
-    /**
-     * TODO: Retrieve changes from a changes token.
-     */
-    suspend fun getChanges(token: String): Flow<ChangesMessage> = flow {
-        Toast.makeText(context, "TODO: get new changes", Toast.LENGTH_SHORT).show()
+    fun getChanges(token: String): Flow<ChangesMessage> = flow {
+        var nextChangesToken = token
+        do {
+            val response = healthConnectClient.getChanges(nextChangesToken)
+            if (response.changesTokenExpired) {
+                throw IOException("Changes token has expired")
+            }
+            emit(ChangesMessage.ChangeList(response.changes))
+            nextChangesToken = response.nextChangesToken
+        } while (response.hasMore)
+        emit(ChangesMessage.NoMoreChanges(nextChangesToken))
     }
 
     /**
